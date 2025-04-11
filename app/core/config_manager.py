@@ -77,7 +77,11 @@ class ConfigManager:
             logger.debug(f"Setting default for {config.SETTINGS_INDEXED_EXTENSIONS}")
             self._settings[config.SETTINGS_INDEXED_EXTENSIONS] = config.DEFAULT_INDEXED_EXTENSIONS
             changed = True
-
+        # --- Ensure default LLM model ---
+        if config.SETTINGS_LLM_MODEL not in self._settings or self.get_setting(config.SETTINGS_LLM_MODEL) not in config.AVAILABLE_LLM_MODELS:
+            logger.debug(f"Setting default for {config.SETTINGS_LLM_MODEL}")
+            self._settings[config.SETTINGS_LLM_MODEL] = config.DEFAULT_LLM_MODEL
+            changed = True
         if changed:
              self.save_settings() # Save if defaults were applied
 
@@ -161,6 +165,22 @@ class ConfigManager:
             self.set_setting(config.SETTINGS_INDEXED_EXTENSIONS, cleaned_extensions)
         else:
             logger.error(f"Attempted to set invalid value for indexed extensions: {extensions}. Must be a list of strings.")
+    # --- LLM Model Methods ---
+    def get_llm_model_name(self) -> str:
+        """Gets the name of the configured LLM model."""
+        model_name = self.get_setting(config.SETTINGS_LLM_MODEL)
+        if model_name in config.AVAILABLE_LLM_MODELS:
+            return model_name
+        else:
+             logger.warning(f"Saved LLM model '{model_name}' no longer available. Using default '{config.DEFAULT_LLM_MODEL}'.")
+             return config.DEFAULT_LLM_MODEL
+
+    def set_llm_model_name(self, model_name: str) -> None:
+        """Sets the name of the LLM model."""
+        if model_name in config.AVAILABLE_LLM_MODELS:
+            self.set_setting(config.SETTINGS_LLM_MODEL, model_name)
+        else:
+            logger.warning(f"Attempted to set unknown LLM model: {model_name}")
 
     def get_db_path(self) -> Optional[Path]:
         """Gets the full path to the database file within the notes folder."""
