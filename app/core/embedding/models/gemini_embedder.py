@@ -23,7 +23,7 @@ except ImportError:
 # Import the application's logger and configuration
 # Adjust the import path if your logger setup is located differently
 try:
-    from app.core.utils.logging_setup import logger
+    from app.utils.logging_setup import logger
 except ImportError:
     # Fallback basic logger if the app's logger isn't available
     import logging

@@ -1,7 +1,7 @@
 # app/core/indexing/chunking.py
 from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from app.core.utils.logging_setup import logger
+from app.utils.logging_setup import logger
 
 CHUNK_SIZE = 500  # Target size of each chunk in characters
 CHUNK_OVERLAP = 50 # Number of characters to overlap between chunks

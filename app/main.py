@@ -13,7 +13,7 @@ env_loaded = load_dotenv()
 from PyQt6.QtWidgets import QApplication
 from app.frontend.main_window import MainWindow
 from app import config
-from app.core.utils.logging_setup import logger 
+from app.utils.logging_setup import logger 
 
 # --- Log whether .env was loaded (optional, for debugging) ---
 if env_loaded:

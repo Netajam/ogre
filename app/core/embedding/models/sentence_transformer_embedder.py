@@ -4,7 +4,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 try:
-    from app.core.utils.logging_setup import logger
+    from app.utils.logging_setup import logger
 except ImportError:
     import logging
     logger = logging.getLogger(__name__)

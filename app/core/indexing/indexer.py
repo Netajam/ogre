@@ -11,7 +11,7 @@ from app.core.indexing.file_handler import FileHandler
 from app.core.indexing.chunking import split_text
 
 try:
-    from app.core.utils.logging_setup import logger
+    from app.utils.logging_setup import logger
 except ImportError:
      import logging
      logger = logging.getLogger(__name__)

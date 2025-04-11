@@ -20,7 +20,7 @@ except ImportError:
 # Import schema definitions and the application logger
 from . import schema
 try:
-    from app.core.utils.logging_setup import logger
+    from app.utils.logging_setup import logger
 except ImportError:
     import logging
     logger = logging.getLogger(__name__)

@@ -8,7 +8,7 @@ from PyQt6.QtCore import QStandardPaths
 
 from app import config
 # Assuming logger setup is correct now
-from app.core.utils.logging_setup import logger
+from app.utils.logging_setup import logger
 
 class ConfigManager:
     """Handles loading and saving application settings."""

@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 from typing import List, Optional
-from app.core.utils.logging_setup import logger
+from app.utils.logging_setup import logger
 
 class FileHandler:
     """Handles discovery and reading of files based on specified extensions."""

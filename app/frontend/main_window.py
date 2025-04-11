@@ -17,7 +17,7 @@ from PyQt6.QtGui import QAction, QIcon # Assuming you might add icons later
 from app import config
 from app.core.config_manager import config_manager # Use the singleton instance
 # Import the application logger
-from app.core.utils.logging_setup import logger
+from app.utils.logging_setup import logger
 # Import the real Indexer (used by IndexerWorker)
 from app.core.indexing.indexer import Indexer
 

@@ -2,7 +2,7 @@
 import os # <-- Add import for os.getenv
 from typing import Any, Optional, Dict
 from app.config import AVAILABLE_EMBEDDING_MODELS, GEMINI_TASK_RETRIEVAL_DOCUMENT
-from app.core.utils.logging_setup import logger
+from app.utils.logging_setup import logger
 from .models.sentence_transformer_embedder import SentenceTransformerEmbedder
 from .models.gemini_embedder import GeminiEmbedder
 
