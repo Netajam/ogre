@@ -5,97 +5,101 @@ from pathlib import Path
 from typing import Optional, List
 
 # --- PyQt6 Imports ---
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QLineEdit, QTextEdit, QStatusBar, QMessageBox, QProgressBar,
-    QSizePolicy, QApplication
+    QSizePolicy, QApplication, QListWidget, QListWidgetItem, QSplitter
 )
-from PyQt6.QtGui import QAction, QIcon # Assuming you might add icons later
+from PyQt6.QtGui import QAction, QIcon, QTextCursor, QDesktopServices
 
 # --- Application Imports ---
 from app import config
-from app.core.config_manager import config_manager # Use the singleton instance
-# Import the application logger
+from app.core.config_manager import config_manager
 from app.utils.logging_setup import logger
-# Import the real Indexer (used by IndexerWorker)
 from app.core.indexing.indexer import Indexer
+from app.core.services.query_service import QueryService
+from app.core.services.result_item import ResultItem
+from app.core.indexing.file_handler import FileHandler
 
-# Placeholder for Settings Dialog (Phase 2/3)
-# from .settings_dialog import SettingsDialog
 
-# --- Indexer Worker Thread ---
+# --- Background Worker for Indexing ---
 class IndexerWorker(QObject):
-    """
-    Worker object that runs the indexing process in a separate thread.
-    Communicates progress and completion via signals.
-    """
-    # Signals:
-    # finished: Emitted when indexing completes or fails. Args: success (bool), message (str)
-    # progress: Emitted periodically with status updates. Args: message (str)
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(str)
 
-    def __init__(self,
-                 notes_folder: str,
-                 db_path: Path,
-                 embedding_model_name: str,
-                 allowed_extensions: List[str]): # <-- Added parameter
+    def __init__(self, notes_folder: str, db_path: Path, embedding_model_name: str, allowed_extensions: List[str]):
         super().__init__()
         self.notes_folder = notes_folder
         self.db_path = db_path
         self.embedding_model_name = embedding_model_name
-        self.allowed_extensions = allowed_extensions # <-- Store it
+        self.allowed_extensions = allowed_extensions
         self.indexer: Optional[Indexer] = None
         self._is_running = False
 
     def run(self):
-        """The main method executed when the thread starts."""
         if self._is_running:
             logger.warning("IndexerWorker.run() called while already running.")
             return
-
         self._is_running = True
         logger.info("IndexerWorker started.")
         try:
-            # Create the actual Indexer instance
             self.indexer = Indexer(
                 notes_folder=self.notes_folder,
                 db_path=self.db_path,
                 embedding_model_name=self.embedding_model_name,
-                                allowed_extensions=self.allowed_extensions,
-                # Connect signals directly to the Indexer's callbacks
+                allowed_extensions=self.allowed_extensions,
                 progress_callback=self.progress.emit,
                 finished_callback=self.finished.emit
             )
-            # Run the main indexing logic
-            # The Indexer itself will emit the finished signal via the callback
             self.indexer.run_indexing()
-
         except Exception as e:
-             # This is a fallback catch-all. Errors should ideally be caught
-             # and reported gracefully by the Indexer itself.
              error_msg = f"Critical error caught in IndexerWorker run loop: {e}"
              logger.error(error_msg, exc_info=True)
-             # Emit finished signal indicating failure if not already emitted by Indexer
              try:
                  self.finished.emit(False, error_msg)
              except Exception as sig_e:
                  logger.error(f"Failed to emit finished signal from worker fallback: {sig_e}")
         finally:
-             # Ensure references are cleared and state is reset
              logger.info("IndexerWorker run finished.")
-             self.indexer = None # Release indexer instance
+             self.indexer = None
              self._is_running = False
 
     def stop(self):
-        """Requests the running Indexer instance to cancel its operation."""
         if self.indexer:
             logger.info("Requesting indexer cancellation via IndexerWorker...")
-            self.indexer.cancel() # Call the Indexer's cancel method
+            self.indexer.cancel()
         else:
-            # This might happen if stop is called after run finished or before it started
             logger.warning("Stop requested for IndexerWorker, but no active Indexer instance found.")
+
+
+# --- Background Worker for Querying ---
+class QueryWorker(QObject):
+    results_ready = pyqtSignal(list) # list will contain ResultItem objects
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, query_text: str, db_path: Path, embedding_model_name: str, notes_folder: str):
+        super().__init__()
+        self.query_text = query_text
+        self.db_path = db_path
+        self.embedding_model_name = embedding_model_name
+        self.notes_folder = notes_folder
+
+    def run(self):
+        logger.info(f"QueryWorker started for query: '{self.query_text[:50]}...'")
+        try:
+            query_service = QueryService(
+                db_path=self.db_path,
+                embedding_model_name=self.embedding_model_name,
+                notes_folder=self.notes_folder
+            )
+            results: List[ResultItem] = query_service.search_chunks(self.query_text)
+            self.results_ready.emit(results)
+            logger.info(f"QueryWorker finished successfully, found {len(results)} results.")
+        except Exception as e:
+            error_msg = f"Error during query execution: {e}"
+            logger.error(error_msg, exc_info=True)
+            self.error_occurred.emit(error_msg)
 
 
 # --- Main Application Window ---
@@ -106,452 +110,375 @@ class MainWindow(QMainWindow):
         super().__init__()
         logger.info("Initializing MainWindow...")
         self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
-        # Set initial size and position (optional)
-        self.setGeometry(200, 200, 800, 600) # x, y, width, height
+        self.setGeometry(200, 200, 900, 700)
 
-        # --- Member Variables ---
-        self._config_mgr = config_manager # Use the shared config manager instance
+        self._config_mgr = config_manager
         self._notes_folder_path: Optional[str] = self._config_mgr.get_notes_folder()
         self._indexing_thread: Optional[QThread] = None
         self._indexing_worker: Optional[IndexerWorker] = None
+        self._query_thread: Optional[QThread] = None
+        self._query_worker: Optional[QueryWorker] = None
 
-        # --- UI Setup ---
-        self._setup_ui() # Create widgets and layouts
-        self._create_menus() # Create File, Help menus etc.
-        self._update_ui_state() # Set initial enabled/disabled states
+        self._setup_ui()
+        self._create_menus()
+        self._update_ui_state()
 
         logger.info("MainWindow initialization complete.")
 
     def _setup_ui(self) -> None:
         """Sets up the main UI elements, widgets, and layouts."""
-        logger.info("Starting UI setup...") # <-- Log Start
-
+        logger.info("Starting UI setup...")
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        logger.info("Central widget set.") # <-- Log After Central Widget
+        main_layout = QVBoxLayout(central_widget)
 
-        # Main vertical layout for the central widget
-        main_layout = QVBoxLayout() # Create layout first
-        central_widget.setLayout(main_layout) # Assign layout to central widget
-        logger.info("Main layout created and assigned.") # <-- Log After Main Layout
-
-        # --- Folder Selection Area (Horizontal Layout) ---
-        folder_layout = QHBoxLayout()
+        # Top Area: Folder Selection and Indexing
+        top_layout = QHBoxLayout()
         self.select_folder_button = QPushButton("Select Notes Folder")
         self.select_folder_button.clicked.connect(self._select_notes_folder)
-
-        self.folder_label = QLabel("No folder selected." if not self._notes_folder_path else f"Notes Folder: {self._notes_folder_path}")
-        self.folder_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred) # Allow label to expand horizontally
-        self.folder_label.setWordWrap(True) # Wrap text if path is long
-
-        folder_layout.addWidget(self.select_folder_button)
-        folder_layout.addWidget(self.folder_label, stretch=1) # Label takes available horizontal space
-        main_layout.addLayout(folder_layout) # Add the horizontal layout to the main vertical layout
-        logger.info("Folder selection UI added.") # <-- Log After Folder UI
-
-        # --- Indexing Button ---
+        self.folder_label = QLabel("No folder selected.")
+        self.folder_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.folder_label.setWordWrap(True)
         self.index_button = QPushButton("Index Notes")
         self.index_button.clicked.connect(self._start_indexing)
-        main_layout.addWidget(self.index_button)
-        logger.info("Index button added.") # <-- Log After Index Button
+        top_layout.addWidget(self.select_folder_button)
+        top_layout.addWidget(self.folder_label, 1)
+        top_layout.addWidget(self.index_button)
+        main_layout.addLayout(top_layout)
 
-        # --- Spacer (Optional) ---
-        # main_layout.addSpacerItem(QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
-
-        # --- Prompt Area ---
-        main_layout.addWidget(QLabel("Enter your query:"))
+        # Middle Area: Query Input
+        query_layout = QHBoxLayout()
+        query_layout.addWidget(QLabel("Query:"))
         self.prompt_input = QLineEdit()
         self.prompt_input.setPlaceholderText("Ask something about your notes...")
-        self.prompt_input.returnPressed.connect(self._handle_query) # Trigger query on Enter key
-        main_layout.addWidget(self.prompt_input)
-
+        self.prompt_input.returnPressed.connect(self._handle_query)
+        query_layout.addWidget(self.prompt_input, 1)
         self.ask_button = QPushButton("Ask")
         self.ask_button.clicked.connect(self._handle_query)
-        # Align ask button? Example:
-        # ask_button_layout = QHBoxLayout()
-        # ask_button_layout.addStretch()
-        # ask_button_layout.addWidget(self.ask_button)
-        # ask_button_layout.addStretch()
-        # main_layout.addLayout(ask_button_layout)
-        main_layout.addWidget(self.ask_button) # Simpler layout for now
-        logger.info("Prompt UI added.") # <-- Log After Prompt UI
+        query_layout.addWidget(self.ask_button)
+        main_layout.addLayout(query_layout)
 
-        # --- Answer Area ---
-        main_layout.addWidget(QLabel("Answer:"))
+        # Bottom Area: Results List and Content View (using QSplitter)
+        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left side: Results List
+        results_widget = QWidget()
+        results_layout = QVBoxLayout(results_widget)
+        results_layout.setContentsMargins(0,0,0,0)
+        results_layout.addWidget(QLabel("Relevant Chunks:"))
+        self.results_list = QListWidget()
+        self.results_list.setWordWrap(False)
+        self.results_list.itemClicked.connect(self._on_result_item_clicked)
+        results_layout.addWidget(self.results_list)
+        bottom_splitter.addWidget(results_widget)
+
+        # Right side: Content/Answer View
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0,0,0,0)
+        content_layout.addWidget(QLabel("Note Content:"))
         self.answer_output = QTextEdit()
         self.answer_output.setReadOnly(True)
-        self.answer_output.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding) # Allow text area to grow
-        main_layout.addWidget(self.answer_output)
-        logger.info("Answer area added.") # <-- Log After Answer Area
+        self.answer_output.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        font = self.answer_output.font(); font.setPointSize(11); self.answer_output.setFont(font)
+        content_layout.addWidget(self.answer_output)
+        bottom_splitter.addWidget(content_widget)
 
-        # --- Status Bar ---
+        bottom_splitter.setStretchFactor(0, 1) # Results list takes ~1/3
+        bottom_splitter.setStretchFactor(1, 2) # Content view takes ~2/3
+        main_layout.addWidget(bottom_splitter, stretch=1)
+
+        # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready.") # Initial status message
-
-        # --- Progress Bar (in Status Bar) ---
         self.progress_bar = QProgressBar()
-        # Initial setup for progress bar (range/value will be set when shown/updated)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False) # Initially hidden
-        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter) # Center percentage text
-        self.progress_bar.setMaximumWidth(200) # Optional: Limit width
-        # Add progress bar as a permanent widget on the right side of the status bar
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False); self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_bar.setMaximumWidth(200)
         self.status_bar.addPermanentWidget(self.progress_bar)
-        logger.info("Status bar and progress bar added.") # <-- Log After Status Bar
-
-        logger.info("Finished UI setup.") # <-- Log End
-
+        self.status_bar.showMessage("Ready.")
+        logger.info("Finished UI setup.")
 
     def _create_menus(self) -> None:
         """Creates the main menu bar and its actions."""
         logger.debug("Creating menus...")
         menu_bar = self.menuBar()
-
-        # --- File Menu ---
         file_menu = menu_bar.addMenu("&File")
-
-        # Settings Action
         settings_action = QAction("&Settings", self)
-        settings_action.setStatusTip("Configure application settings") # Tooltip for status bar
+        settings_action.setStatusTip("Configure application settings")
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
-
         file_menu.addSeparator()
-
-        # Exit Action
         exit_action = QAction("&Exit", self)
         exit_action.setStatusTip("Exit the application")
-        exit_action.setShortcut("Ctrl+Q") # Example shortcut
-        exit_action.triggered.connect(self.close) # Connect to the main window's close method
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
-
-        # --- Help Menu (Optional) ---
-        # help_menu = menu_bar.addMenu("&Help")
-        # about_action = QAction("&About", self)
-        # about_action.setStatusTip(f"About {config.APP_NAME}")
-        # # about_action.triggered.connect(self._show_about_dialog) # Need to implement _show_about_dialog
-        # help_menu.addAction(about_action)
-
         logger.debug("Menus created.")
 
-
     def _update_ui_state(self) -> None:
-        """
-        Updates the enabled/disabled state and text of UI elements based on
-        the application's current state (folder selected, indexing running, etc.).
-        """
+        """Updates the enabled/disabled state of UI elements."""
         logger.debug("Updating UI state...")
         folder_selected = bool(self._notes_folder_path)
         is_indexing = self._indexing_thread is not None and self._indexing_thread.isRunning()
+        is_querying = self._query_thread is not None and self._query_thread.isRunning()
 
-        # Update folder label
-        if folder_selected:
-            self.folder_label.setText(f"Notes Folder: {self._notes_folder_path}")
-        else:
-            self.folder_label.setText("No folder selected. Please select your notes folder.")
+        if folder_selected: self.folder_label.setText(f"Notes: {self._notes_folder_path}")
+        else: self.folder_label.setText("No folder selected.")
 
-        # Enable/disable based on folder selection and indexing status
-        self.select_folder_button.setEnabled(not is_indexing)
-        self.index_button.setEnabled(folder_selected and not is_indexing)
+        busy = is_indexing or is_querying
+        self.select_folder_button.setEnabled(not busy)
+        self.index_button.setEnabled(folder_selected and not busy)
 
-        # Query controls depend on folder selection AND whether indexing is running
-        # We might also check if a database exists later for more refinement
         db_path = self._config_mgr.get_db_path()
-        db_exists = db_path is not None and db_path.exists() # Basic check
-        can_query = folder_selected and not is_indexing # and db_exists # Add db_exists check later if desired
-
+        db_exists = db_path is not None and db_path.exists()
+        can_query = folder_selected and db_exists and not busy
         self.prompt_input.setEnabled(can_query)
         self.ask_button.setEnabled(can_query)
 
-        # Show/hide progress bar
-        self.progress_bar.setVisible(is_indexing)
-        if not is_indexing:
-            self.progress_bar.setValue(0) # Reset progress bar when not running
+        self.progress_bar.setVisible(busy)
+        if not busy: self.progress_bar.setValue(0)
 
-        # Update status bar message based on state?
-        if is_indexing:
-            # Progress message is handled by _update_progress signal
-            pass
-        elif folder_selected:
-            self.status_bar.showMessage("Ready.")
-        else:
-            self.status_bar.showMessage("Please select a notes folder.")
+        if is_indexing: self.status_bar.showMessage("Indexing in progress...")
+        elif is_querying: self.status_bar.showMessage("Searching notes...")
+        elif folder_selected: self.status_bar.showMessage("Ready.")
+        else: self.status_bar.showMessage("Please select a notes folder.")
 
-        logger.debug(f"UI state updated: folder_selected={folder_selected}, is_indexing={is_indexing}, can_query={can_query}")
-
+        logger.debug(f"UI state updated: folder={folder_selected}, indexing={is_indexing}, querying={is_querying}, can_query={can_query}")
 
     def _select_notes_folder(self) -> None:
         """Opens a dialog to select the notes folder and updates configuration."""
         logger.info("Select Notes Folder button clicked.")
-        current_folder = self._notes_folder_path or str(Path.home()) # Start in current folder or home
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Notes Folder",
-            current_folder,
-            # Options can be added, e.g., QFileDialog.Option.ShowDirsOnly
-        )
-        if folder: # User selected a folder (didn't cancel)
-            folder_path = str(Path(folder).resolve()) # Use absolute path
+        current_folder = self._notes_folder_path or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select Notes Folder", current_folder)
+        if folder:
+            folder_path = str(Path(folder).resolve())
             logger.info(f"Notes folder selected: {folder_path}")
             self._notes_folder_path = folder_path
-            self._config_mgr.set_notes_folder(folder_path) # Save to config
-            self._update_ui_state() # Update UI based on new folder path
-            # No automatic indexing, user must click "Index Notes"
+            self._config_mgr.set_notes_folder(folder_path)
+            self.results_list.clear() # Clear results when folder changes
+            self.answer_output.clear()
+            self._update_ui_state()
         else:
              logger.info("Folder selection cancelled by user.")
-
 
     def _start_indexing(self) -> None:
         """Starts the indexing process in a separate thread."""
         logger.info("Index Notes button clicked.")
         if not self._notes_folder_path:
-            logger.warning("Indexing attempt failed: Notes folder not set.")
-            QMessageBox.warning(self, "Folder Not Set", "Please select a notes folder first.")
-            return
+            QMessageBox.warning(self, "Folder Not Set", "Please select a notes folder first."); return
         if self._indexing_thread and self._indexing_thread.isRunning():
-            logger.warning("Indexing attempt failed: Indexing already in progress.")
-            QMessageBox.information(self, "Indexing Running", "Indexing is already in progress.")
-            return
+            QMessageBox.information(self, "Indexing Running", "Indexing is already in progress."); return
+        if self._query_thread and self._query_thread.isRunning():
+             QMessageBox.information(self, "Busy", "Please wait for the current query to finish."); return
 
-        # Get necessary parameters from config manager
         db_path = self._config_mgr.get_db_path()
-        if not db_path:
-            # This should not happen if notes_folder_path is set, but check anyway
-            logger.error("Indexing failed: Could not determine database path.")
-            QMessageBox.critical(self, "Error", "Could not determine database path. Check notes folder configuration.")
-            return
-
         embedding_model_name = self._config_mgr.get_embedding_model_name()
         allowed_extensions = self._config_mgr.get_indexed_extensions()
-        if not allowed_extensions:
-             logger.error("Indexing failed: No file extensions are configured for indexing. Check settings.")
-             QMessageBox.critical(self, "Configuration Error", "No file extensions configured for indexing.\nPlease check the application settings (currently requires manual edit of settings.json).")
-             return
-        logger.info(f"Starting indexing process for folder: {self._notes_folder_path}")
-        logger.info(f"Using database: {db_path}")
-        logger.info(f"Using embedding model: {embedding_model_name}")
 
-        # Ensure the directory for the DB exists (DbManager also does this, but good practice)
-        try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-             logger.error(f"Could not create directory for database {db_path.parent}: {e}")
-             QMessageBox.critical(self, "Error", f"Could not create directory for database: {e}")
-             return
+        if not db_path: QMessageBox.critical(self, "Error", "Could not determine database path."); return
+        if not allowed_extensions: QMessageBox.critical(self, "Config Error", "No file extensions configured for indexing."); return
+        try: db_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e: QMessageBox.critical(self, "Error", f"Could not create directory for database: {e}"); return
 
-        # --- Setup Thread and Worker ---
-        self.status_bar.showMessage("Starting indexing...")
-        self.progress_bar.setRange(0, 0) # Set to indeterminate initially
-        self.progress_bar.setValue(-1) # Style hint for indeterminate in some themes
-        self._update_ui_state() # Disable buttons etc.
+        logger.info(f"Starting indexing: Folder={self._notes_folder_path}, Ext={allowed_extensions}, DB={db_path}, Model={embedding_model_name}")
+        self.status_bar.showMessage("Starting indexing..."); self.progress_bar.setRange(0, 0); self.progress_bar.setValue(-1)
+        self._update_ui_state()
 
-        self._indexing_thread = QThread(self) # Pass parent for lifetime management?
+        self._indexing_thread = QThread(self)
         self._indexing_worker = IndexerWorker(
             notes_folder=self._notes_folder_path,
             db_path=db_path,
             embedding_model_name=embedding_model_name,
-            allowed_extensions=allowed_extensions 
-
+            allowed_extensions=allowed_extensions
         )
         self._indexing_worker.moveToThread(self._indexing_thread)
-
-        # --- Connect Signals ---
-        # Worker -> UI Thread
         self._indexing_worker.finished.connect(self._on_indexing_finished)
         self._indexing_worker.progress.connect(self._update_progress)
-        # Thread Control / Cleanup
         self._indexing_thread.started.connect(self._indexing_worker.run)
-        self._indexing_worker.finished.connect(self._indexing_thread.quit) # Stop thread event loop when worker done
-        # Ensure worker is deleted after thread finishes its event loop
+        self._indexing_worker.finished.connect(self._indexing_thread.quit)
         self._indexing_thread.finished.connect(self._indexing_worker.deleteLater)
-        # Ensure thread object itself is deleted after it finishes
-        self._indexing_thread.finished.connect(self._clear_indexing_references) # Also clears our references
-
-        # --- Start Thread ---
+        self._indexing_thread.finished.connect(self._clear_indexing_references)
         self._indexing_thread.start()
         logger.info("Indexing thread started.")
 
-
     def _on_indexing_finished(self, success: bool, message: str) -> None:
         """Slot called when the IndexerWorker emits the 'finished' signal."""
-        # This slot is executed in the UI thread
-        logger.info(f"Indexing finished signal received. Success: {success}, Message: {message}")
-
-        # Update status bar immediately
-        self.status_bar.showMessage(message, 10000) # Show message for 10 seconds
-
-        # Reset progress bar (state updated in _clear_indexing_references/ _update_ui_state)
+        logger.info(f"Indexing finished signal. Success: {success}, Msg: {message}")
+        self.status_bar.showMessage(message, 10000)
         self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
 
-        # Show message box to user
-        if success:
-            QMessageBox.information(self, "Indexing Complete", message)
-        else:
-            # Check if it was a user cancellation
-            if "cancelled" in message.lower():
-                 QMessageBox.warning(self, "Indexing Cancelled", message)
-            else:
-                 # Show critical error for other failures
-                 QMessageBox.critical(self, "Indexing Error", message)
-
-        # Note: UI state update happens in _clear_indexing_references after thread truly finishes
-
+        if success: QMessageBox.information(self, "Indexing Complete", message)
+        elif "cancelled" in message.lower(): QMessageBox.warning(self, "Indexing Cancelled", message)
+        else: QMessageBox.critical(self, "Indexing Error", message)
+        # State update happens in _clear_indexing_references
 
     def _clear_indexing_references(self):
-        """Slot called when the indexing QThread finishes its execution."""
-        # This slot is executed in the UI thread
-        logger.debug("Indexing thread finished signal received, clearing references.")
+        """Slot called when the indexing QThread finishes."""
+        logger.debug("Clearing indexing thread references.")
         self._indexing_thread = None
         self._indexing_worker = None
-        # Update UI state *after* references are cleared and thread is known to be done
         self._update_ui_state()
-
 
     def _update_progress(self, message: str) -> None:
         """Slot called when the IndexerWorker emits the 'progress' signal."""
-        # This slot is executed in the UI thread
         logger.debug(f"Indexing progress: {message}")
         self.status_bar.showMessage(message)
-
-        # --- Attempt to parse progress for determinate progress bar ---
-        # This parsing is brittle; a better approach is dedicated progress signals (e.g., percent)
+        # Progress bar parsing logic (can be improved)
         if "Processing file" in message:
              try:
-                 parts = message.split(" ")
-                 if "/" in parts[2]: # Expected format: "Processing file 5/10: ..."
-                     current, total = map(int, parts[2].split('/')[0:2])
-                     if total > 0:
-                         percent = int((current / total) * 95) # Leave last 5% for embedding/storing phase
-                         self.progress_bar.setRange(0, 100)
-                         self.progress_bar.setValue(percent)
-                     else: # Avoid division by zero if total is 0
-                         self.progress_bar.setRange(0, 0) # Indeterminate
-                         self.progress_bar.setValue(-1)
-                 else: # Unexpected format
-                     self.progress_bar.setRange(0, 0) # Indeterminate
-                     self.progress_bar.setValue(-1)
-             except (IndexError, ValueError):
-                  logger.warning(f"Could not parse progress percentage from message: '{message}'")
-                  self.progress_bar.setRange(0, 0) # Fallback to indeterminate
-                  self.progress_bar.setValue(-1)
-        elif "Embedding batch" in message or "Storing chunks" in message:
-             # Use indeterminate or show a fixed high percentage during final stages
-             self.progress_bar.setRange(0, 100)
-             self.progress_bar.setValue(98) # Example: show near completion
-        elif "Scanning" in message or "Checking index" in message or "Initializing" in message:
-             self.progress_bar.setRange(0, 0) # Indeterminate during setup
-             self.progress_bar.setValue(-1)
-
+                 parts = message.split(" "); current, total = map(int, parts[2].split('/')[0:2])
+                 if total > 0: percent = int((current / total) * 95); self.progress_bar.setRange(0, 100); self.progress_bar.setValue(percent)
+                 else: self.progress_bar.setRange(0, 0); self.progress_bar.setValue(-1)
+             except: self.progress_bar.setRange(0, 0); self.progress_bar.setValue(-1) # Fallback
+        elif "Embedding" in message or "Storing" in message: self.progress_bar.setRange(0, 100); self.progress_bar.setValue(98)
+        elif "Scanning" in message or "Checking" in message or "Initializing" in message: self.progress_bar.setRange(0, 0); self.progress_bar.setValue(-1)
 
     def _handle_query(self) -> None:
-        """Handles the 'Ask' button click or Enter press in the prompt input."""
+        """Handles the 'Ask' button click. Starts the QueryWorker."""
         logger.debug("Handle query triggered.")
         query_text = self.prompt_input.text().strip()
-        if not query_text:
-            logger.debug("Query input is empty, ignoring.")
-            return # Ignore empty queries
+        if not query_text: return
 
-        # Check prerequisites
-        if not self._notes_folder_path:
-             logger.warning("Query attempt failed: Notes folder not set.")
-             QMessageBox.warning(self, "Folder Not Set", "Please select a notes folder first.")
-             return
-        if self._indexing_thread and self._indexing_thread.isRunning():
-             logger.warning("Query attempt failed: Indexing is currently running.")
-             QMessageBox.information(self, "Indexing Running", "Please wait for indexing to finish before asking questions.")
-             return
+        if not self._notes_folder_path: QMessageBox.warning(self, "Folder Not Set", "Please select a notes folder first."); return
+        if self._indexing_thread and self._indexing_thread.isRunning(): QMessageBox.information(self, "Busy", "Please wait for indexing to finish."); return
+        if self._query_thread and self._query_thread.isRunning(): QMessageBox.information(self, "Busy", "Please wait for the current query to finish."); return
 
-        # --- Placeholder for actual query logic (Phase 3) ---
-        # This should run in a separate thread similar to indexing!
-        logger.info(f"Received query: '{query_text}'")
-        self.answer_output.setText("Thinking...") # Provide immediate feedback
-        self.status_bar.showMessage(f"Processing query: {query_text[:50]}...")
-        QApplication.processEvents() # Ensure UI updates are shown
+        db_path = self._config_mgr.get_db_path()
+        embedding_model_name = self._config_mgr.get_embedding_model_name()
+
+        if not db_path or not db_path.exists(): QMessageBox.warning(self, "Database Not Found", "Notes database not found. Please index notes first."); return
+
+        logger.info(f"Starting query: '{query_text[:50]}...'")
+        self.results_list.clear()
+        self.answer_output.setText("Searching...") # Show immediate feedback
+        self.status_bar.showMessage("Searching notes..."); self.progress_bar.setRange(0, 0); self.progress_bar.setValue(-1)
+        self._update_ui_state()
+
+        self._query_thread = QThread(self)
+        self._query_worker = QueryWorker(
+            query_text=query_text, db_path=db_path,
+            embedding_model_name=embedding_model_name, notes_folder=self._notes_folder_path
+        )
+        self._query_worker.moveToThread(self._query_thread)
+        self._query_worker.results_ready.connect(self._on_search_results)
+        self._query_worker.error_occurred.connect(self._on_query_error)
+        self._query_thread.started.connect(self._query_worker.run)
+        self._query_worker.results_ready.connect(self._query_thread.quit)
+        self._query_worker.error_occurred.connect(self._query_thread.quit)
+        self._query_thread.finished.connect(self._query_worker.deleteLater)
+        self._query_thread.finished.connect(self._clear_query_references)
+        self._query_thread.start()
+        logger.info("Query thread started.")
+
+    def _on_search_results(self, results: List[ResultItem]):
+        """Slot called when QueryWorker emits 'results_ready'."""
+        logger.info(f"Received {len(results)} search results.")
+        self.status_bar.showMessage(f"Found {len(results)} relevant chunks.", 5000)
+        self.answer_output.clear() # Clear "Searching..." message
+
+        self.results_list.clear()
+        if not results:
+            item = QListWidgetItem("No relevant chunks found.")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.results_list.addItem(item)
+        else:
+            for result_item in results:
+                list_item = QListWidgetItem(result_item.display_text())
+                list_item.setData(Qt.ItemDataRole.UserRole, result_item)
+                list_item.setToolTip(f"Path: {result_item.file_path}\nScore: {result_item.score:.4f}")
+                self.results_list.addItem(list_item)
+
+        # TODO (Phase 3c): Optionally generate LLM summary here and display in self.answer_output
+        # For now, just clear the prompt
+        self.prompt_input.clear()
+        # Cleanup handled by _clear_query_references
+
+    def _on_query_error(self, error_message: str):
+        """Slot called when QueryWorker emits 'error_occurred'."""
+        logger.error(f"Query error signal received: {error_message}")
+        self.status_bar.showMessage("Query failed.", 5000)
+        QMessageBox.critical(self, "Query Error", f"An error occurred during the search:\n{error_message}")
+        self.results_list.clear()
+        self.answer_output.setText("Error during search.") # Show error in main view too
+        # Cleanup handled by _clear_query_references
+
+    def _clear_query_references(self):
+        """Slot called when the query QThread finishes."""
+        logger.debug("Query thread finished, clearing references.")
+        self._query_thread = None
+        self._query_worker = None
+        self._update_ui_state()
+
+    def _on_result_item_clicked(self, item: QListWidgetItem):
+        """Slot called when an item in the results list is clicked."""
+        result_data: Optional[ResultItem] = item.data(Qt.ItemDataRole.UserRole)
+        if not result_data:
+            logger.warning("Clicked list item has no ResultItem data.")
+            self.answer_output.setText("Error: Could not load data for this item.")
+            return
+
+        logger.info(f"Result item clicked: {result_data.file_path.name} - Chunk {result_data.chunk_index}")
+        self.status_bar.showMessage(f"Loading content for {result_data.file_path.name}...")
+        QApplication.processEvents()
 
         try:
-            # --- TODO: Replace with actual query service call in Phase 3 ---
-            # Example structure:
-            # query_thread = QThread()
-            # query_worker = QueryWorker(query_text, self._config_mgr.get_db_path(), self._config_mgr.get_embedding_model_name())
-            # query_worker.moveToThread(query_thread)
-            # query_worker.result_ready.connect(self._on_query_result)
-            # query_worker.error_occurred.connect(self._on_query_error)
-            # query_thread.started.connect(query_worker.run)
-            # query_worker.finished.connect(query_thread.quit)
-            # query_worker.finished.connect(query_worker.deleteLater)
-            # query_thread.finished.connect(query_thread.deleteLater)
-            # query_thread.start()
-            # -----------------------------------------------------------
+            full_content = FileHandler.read_file_content(result_data.file_path)
+            if full_content is None:
+                self.answer_output.setText(f"Error: Could not read file:\n{result_data.file_path}")
+                self.status_bar.showMessage("Error reading file.", 5000)
+                return
 
-            # --- Simulate work for now ---
-            import time
-            time.sleep(1.5)
-            # result = query_service.answer_query(query_text) # Future implementation
-            result = f"Placeholder answer for query: '{query_text}'.\nActual LLM integration and vector search needed (Phase 3)."
-            logger.info("Simulated query processing finished.")
-            self.answer_output.setText(result)
-            self.status_bar.showMessage("Query processed.", 5000) # Show for 5 seconds
-            self.prompt_input.clear() # Clear input after processing
+            self.answer_output.setPlainText(full_content)
+            chunk_text = result_data.content
+            cursor = self.answer_output.textCursor()
+            start_pos = full_content.find(chunk_text)
+
+            if start_pos != -1:
+                cursor.setPosition(start_pos)
+                cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, len(chunk_text))
+                self.answer_output.setTextCursor(cursor)
+                self.answer_output.ensureCursorVisible()
+                logger.debug(f"Scrolled and highlighted chunk {result_data.chunk_index} in {result_data.file_path.name}.")
+            else:
+                logger.warning(f"Could not find exact chunk text within {result_data.file_path.name}. Scrolling to top.")
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                self.answer_output.setTextCursor(cursor); self.answer_output.ensureCursorVisible()
+
+            self.status_bar.showMessage(f"Displayed content for {result_data.file_path.name}", 5000)
 
         except Exception as e:
-             # Catch errors during the (simulated) query process
-             logger.error(f"Error during query processing: {e}", exc_info=True)
-             QMessageBox.critical(self, "Query Error", f"An error occurred while processing the query:\n{e}")
-             self.answer_output.setText("Error processing query.")
-             self.status_bar.showMessage("Query failed.", 5000)
-
+            logger.error(f"Error displaying file content for {result_data.file_path}: {e}", exc_info=True)
+            self.answer_output.setText(f"Error loading content:\n{e}")
+            self.status_bar.showMessage("Error displaying content.", 5000)
 
     def _open_settings(self) -> None:
         """Opens the settings dialog (placeholder)."""
         logger.info("Settings action triggered.")
-        # In a later phase, this will instantiate and show the SettingsDialog:
-        # settings_dialog = SettingsDialog(self) # Pass self as parent
-        # settings_dialog.settings_changed.connect(self._on_settings_changed) # Optional signal
-        # settings_dialog.exec() # Show as modal dialog
-        QMessageBox.information(self, "Settings", "Settings dialog not implemented yet (Phase 3).")
-
-
-    # def _on_settings_changed(self):
-    #     """ Slot called if settings dialog emits a signal indicating changes. """
-    #     logger.info("Settings potentially changed, updating UI state.")
-    #     # Re-read relevant settings if necessary
-    #     self._notes_folder_path = self._config_mgr.get_notes_folder()
-    #     # Update UI elements that depend on settings
-    #     self._update_ui_state()
-
+        QMessageBox.information(self, "Settings", "Settings dialog not implemented yet.")
 
     def closeEvent(self, event) -> None:
-        """Handles the window closing event (e.g., clicking the 'X' button)."""
+        """Handles the window closing event."""
         logger.debug("Close event triggered.")
-        # Check if indexing is running and ask for confirmation
-        if self._indexing_thread and self._indexing_thread.isRunning():
-             logger.warning("Close requested while indexing is in progress.")
-             reply = QMessageBox.question(self, 'Confirm Exit',
-                                        "Indexing is in progress. Exiting now might leave the index incomplete.\nAre you sure you want to exit?",
+        is_indexing = self._indexing_thread and self._indexing_thread.isRunning()
+        is_querying = self._query_thread and self._query_thread.isRunning()
+
+        if is_indexing or is_querying:
+            operation = "Indexing" if is_indexing else "Querying"
+            logger.warning(f"Close requested while {operation} is in progress.")
+            reply = QMessageBox.question(self, 'Confirm Exit',
+                                        f"{operation} is in progress. Are you sure you want to exit?",
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                        QMessageBox.StandardButton.No) # Default to No
-
-             if reply == QMessageBox.StandardButton.Yes:
-                 logger.info("User confirmed exit during indexing. Attempting cancellation...")
-                 if self._indexing_worker:
-                     # Politely ask the worker (and its Indexer) to stop
-                     self._indexing_worker.stop()
-                     # Give it a brief moment to potentially react? Not strictly necessary
-                     # QApplication.processEvents()
-                     # time.sleep(0.1)
-
-                 # Note: We don't forcefully terminate the thread here as it can
-                 # cause data corruption. We allow the app to close, and the thread
-                 # will exit when the process terminates or when it finishes/cancels.
-                 logger.info("Proceeding with exit.")
-                 event.accept() # Allow the window to close
-             else:
-                 logger.info("User cancelled exit during indexing.")
-                 event.ignore() # Prevent the window from closing
+                                        QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                 logger.info(f"User confirmed exit during {operation}.")
+                 if is_indexing and self._indexing_worker: self._indexing_worker.stop()
+                 # Add query cancellation here if QueryWorker implements stop() later
+                 event.accept()
+            else:
+                 logger.info(f"User cancelled exit during {operation}.")
+                 event.ignore()
         else:
              logger.info("Closing application.")
-             event.accept() # Allow closing if indexing is not running
+             event.accept()

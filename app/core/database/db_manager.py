@@ -2,23 +2,29 @@
 import sqlite3
 import time
 from pathlib import Path
+import os
+import json # Keep for potential future use, though not strictly needed for MATCH query params
+import sys
+import importlib.util
 from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 
 try:
-    # We still need to import sqlite_vec to make its functions available
     import sqlite_vec
     SQLITE_VEC_AVAILABLE = True
 except ImportError:
-    sqlite_vec = None # Keep this structure for checks elsewhere if needed
+    sqlite_vec = None
     SQLITE_VEC_AVAILABLE = False
     print("--------------------------------------------------------------------")
-    print("WARNING: sqlite-vec library not found. Vector operations disabled.")
+    print("WARNING: sqlite-vec library not found. Database operations disabled.")
     print("         Install it using: pip install sqlite-vec")
     print("--------------------------------------------------------------------")
 
 # Import schema definitions and the application logger
 from . import schema
+# --- Import the serialize_vector function ---
+from .utils import serialize_vector
+# ---
 try:
     from app.utils.logging_setup import logger
 except ImportError:
@@ -30,33 +36,19 @@ except ImportError:
 
 class DbManager:
     """
-    Manages interactions with the SQLite database, utilizing the sqlite-vec
-    extension for vector storage and search.
+    Manages interactions with the SQLite database, using the vec0 virtual table
+    approach provided by sqlite-vec version 0.1.x.
     """
 
     def __init__(self, db_path: Path):
-        """
-        Initializes the DbManager and establishes a connection to the database.
-
-        Args:
-            db_path: The Path object pointing to the SQLite database file.
-
-        Raises:
-            ImportError: If the sqlite-vec library is not installed.
-            ConnectionError: If the database directory cannot be created or
-                             if the database connection fails.
-        """
-        # Check if sqlite_vec was successfully imported (needed for vector functions)
+        """Initializes the DbManager and establishes a connection."""
         if not SQLITE_VEC_AVAILABLE:
             raise ImportError("sqlite-vec library is required but not installed.")
 
         self.db_path = db_path
-        # --- Update Type Hints to use sqlite3 ---
-        self.conn: Optional[sqlite3.Connection] = None 
-        self.cursor: Optional[sqlite3.Cursor] = None  
-        # -----------------------------------------
+        self.conn: Optional[sqlite3.Connection] = None
+        self.cursor: Optional[sqlite3.Cursor] = None
 
-        # Ensure the directory exists before trying to connect
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             logger.debug(f"Ensured database directory exists: {self.db_path.parent}")
@@ -64,270 +56,273 @@ class DbManager:
             logger.error(f"Failed to create database directory {self.db_path.parent}: {e}")
             raise ConnectionError(f"Could not create database directory: {e}") from e
 
-        # Establish connection during initialization
         self._connect()
 
     def _connect(self) -> None:
-        """Establishes a connection to the SQLite database using the standard sqlite3 module."""
+        """Establishes a connection and loads the sqlite-vec extension."""
         try:
             logger.debug(f"Attempting to connect to database using sqlite3: {self.db_path}")
-            # --- Use sqlite3.connect ---
+            # Use standard sqlite3 connect
             self.conn = sqlite3.connect(str(self.db_path))
-            # ---------------------------
+
+            # --- Load sqlite-vec extension using its helper ---
             try:
                 self.conn.enable_load_extension(True)
                 logger.debug("Enabled loading of SQLite extensions.")
+                # Use the library's load function
+                sqlite_vec.load(self.conn)
+                logger.info("sqlite-vec extension loaded successfully via sqlite_vec.load().")
             except AttributeError:
-                 logger.warning("sqlite3.Connection object has no attribute 'enable_load_extension'. This might be an issue on some Python versions/builds.")
-            except sqlite3.Error as ext_err:
-                 logger.warning(f"Could not enable extension loading: {ext_err}")
-
+                 logger.warning("sqlite3.Connection has no 'enable_load_extension'. Extension loading might fail.")
+            except Exception as e:
+                 logger.error(f"Failed to load sqlite-vec extension using sqlite_vec.load(): {e}", exc_info=True)
+                 if self.conn: self.conn.close() # Close connection if loading failed
+                 self.conn = None
+                 raise ConnectionError("Failed to load required sqlite-vec extension.") from e
+            # --- End Extension Loading ---
 
             self.cursor = self.conn.cursor()
             logger.info(f"Successfully connected to database: {self.db_path}")
 
-        except sqlite3.Error as e: 
-            logger.error(f"Error connecting to database {self.db_path}: {e}", exc_info=True)
-            self.conn = None
-            self.cursor = None
-            raise ConnectionError(f"Failed to connect to database {self.db_path}: {e}") from e
-        except Exception as e: # Catch any other unexpected errors during connection
-            logger.error(f"Unexpected error connecting to database {self.db_path}: {e}", exc_info=True)
-            self.conn = None
-            self.cursor = None
-            raise ConnectionError(f"Unexpected error connecting to database: {e}") from e
-
-
-    def initialize_db(self, embedding_dim: int) -> None:
-        """
-        Creates necessary tables and indexes if they don't already exist.
-        Requires the embedding dimension to correctly define the VECTOR column.
-        """
-        if not self.cursor or not self.conn:
-            logger.error("Database connection not established. Cannot initialize.")
-            raise ConnectionError("Database not connected")
-        if not isinstance(embedding_dim, int) or embedding_dim <= 0:
-             logger.error(f"Invalid embedding dimension provided for DB initialization: {embedding_dim}")
-             raise ValueError("Embedding dimension must be a positive integer.")
-
-        try:
-            logger.info(f"Initializing database schema with embedding dimension: {embedding_dim}")
-
-            create_table_sql = schema.get_create_table_sql(embedding_dim)
-            logger.debug(f"Executing SQL: {create_table_sql}")
-            self.cursor.execute(create_table_sql)
-            logger.debug("Documents table created or already exists.")
-
-            create_fp_index_sql = schema.get_create_file_path_index_sql()
-            logger.debug(f"Executing SQL: {create_fp_index_sql}")
-            self.cursor.execute(create_fp_index_sql)
-            logger.debug("File path index created or already exists.")
-
-            logger.info("Vector index will be created automatically by sqlite-vec upon first insertion if needed.")
-
-            self.conn.commit()
-            logger.info("Database schema initialization successful (or tables/indexes already existed).")
+            # Verification of function is less direct with MATCH operator, rely on successful load
 
         except sqlite3.Error as e:
-            logger.error(f"Error initializing database schema: {e}", exc_info=True)
-            try:
-                self.conn.rollback()
-            except Exception as rb_err:
-                 logger.error(f"Error during rollback after schema initialization failure: {rb_err}")
-            raise
+            logger.error(f"Error connecting to database {self.db_path}: {e}", exc_info=True)
+            self.conn, self.cursor = None, None
+            raise ConnectionError(f"Failed to connect to database {self.db_path}: {e}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error connecting to database {self.db_path}: {e}", exc_info=True)
+            self.conn, self.cursor = None, None
+            raise ConnectionError(f"Unexpected error connecting to database: {e}") from e
 
+    def initialize_db(self, embedding_dim: int) -> None:
+        """Creates the main documents table and the vec0 virtual table."""
+        if not self.cursor or not self.conn: raise ConnectionError("Database not connected")
+        if not isinstance(embedding_dim, int) or embedding_dim <= 0: raise ValueError("Embedding dimension must be positive.")
+
+        try:
+            logger.info(f"Initializing database schema (vec0) with embedding dimension: {embedding_dim}")
+
+            # Create main documents table
+            create_docs_sql = schema.get_create_documents_table_sql()
+            logger.debug(f"Executing SQL: Create documents table")
+            self.cursor.execute(create_docs_sql)
+
+            # Create virtual table for vectors
+            create_vec_sql = schema.get_create_virtual_table_sql(embedding_dim)
+            logger.debug(f"Executing SQL: Create vec_documents virtual table")
+            self.cursor.execute(create_vec_sql)
+
+            # Create index on file path in main table
+            create_idx_sql = schema.get_create_file_path_index_sql()
+            logger.debug(f"Executing SQL: Create file path index")
+            self.cursor.execute(create_idx_sql)
+
+            self.conn.commit()
+            logger.info("Database schema (vec0) initialization successful.")
+
+        except sqlite3.Error as e:
+            logger.error(f"Error initializing database schema (vec0): {e}", exc_info=True)
+            try: self.conn.rollback()
+            except Exception as rb_err: logger.error(f"Rollback failed after schema init error: {rb_err}")
+            raise
 
     def add_chunks_batch(self, chunks_data: List[Tuple[str, int, str, np.ndarray, float]]) -> None:
         """
-        Adds multiple document chunks (including embeddings) to the database in a single transaction.
+        Adds chunks and their serialized vectors to the database.
+        NOTE: Due to virtual table limitations, this iterates inserts within a transaction,
+              it's not a true single batch operation.
         """
-        if not self.cursor or not self.conn:
-            logger.error("Database connection not established. Cannot add chunks.")
-            raise ConnectionError("Database not connected")
-        if not chunks_data:
-            logger.info("No chunks provided to add_chunks_batch. Nothing to add.")
-            return
+        if not self.cursor or not self.conn: raise ConnectionError("Database not connected")
+        if not chunks_data: logger.info("No chunks provided to add_chunks_batch."); return
 
-        insert_sql = schema.get_insert_chunk_sql()
+        insert_doc_sql = schema.get_insert_document_sql()
+        insert_vec_sql = schema.get_insert_vector_sql()
+        added_doc_count = 0
+        added_vec_count = 0
+        start_time = time.time()
+
         try:
-            start_time = time.time()
-            logger.debug(f"Executing batch insert for {len(chunks_data)} chunks...")
-            self.cursor.executemany(insert_sql, chunks_data) # Try direct insertion first
+            logger.debug(f"Starting transaction to insert {len(chunks_data)} chunks/vectors.")
+            # Begin transaction manually for better control
+            self.cursor.execute("BEGIN TRANSACTION;")
+
+            for file_path, chunk_index, content, embedding, last_modified in chunks_data:
+                try:
+                    # 1. Insert into main documents table
+                    doc_params = (file_path, chunk_index, content, last_modified)
+                    self.cursor.execute(insert_doc_sql, doc_params)
+                    doc_id = self.cursor.lastrowid # Get the ID of the inserted document row
+                    added_doc_count += 1
+
+                    # 2. Serialize the vector
+                    serialized_embedding = serialize_vector(embedding)
+
+                    # 3. Insert into virtual vector table using the document ID
+                    vec_params = (doc_id, serialized_embedding)
+                    self.cursor.execute(insert_vec_sql, vec_params)
+                    added_vec_count += 1
+
+                except sqlite3.Error as insert_err:
+                     logger.error(f"Error inserting chunk {chunk_index} for file {file_path}: {insert_err}", exc_info=True)
+                     # Skip this chunk and continue with the next within the transaction
+                     continue # Or raise? Raising would rollback everything. Skipping allows partial success.
+                except ValueError as ser_err: # Catch serialization errors
+                     logger.error(f"Error serializing vector for chunk {chunk_index} file {file_path}: {ser_err}", exc_info=True)
+                     continue # Skip this chunk
+
+            # Commit transaction after processing all chunks
             self.conn.commit()
             duration = time.time() - start_time
-            logger.info(f"Successfully added batch of {len(chunks_data)} chunks in {duration:.3f}s.")
-        except sqlite3.Error as e:
-            logger.error(f"Error adding chunks batch: {e}", exc_info=True)
-            try:
-                self.conn.rollback()
-            except Exception as rb_err:
-                 logger.error(f"Error during rollback after chunk insertion failure: {rb_err}")
-            raise
+            logger.info(f"Finished inserting chunks. Added {added_doc_count} docs, {added_vec_count} vectors in {duration:.3f}s.")
+            if added_doc_count != added_vec_count:
+                 logger.warning(f"Mismatch between added documents ({added_doc_count}) and vectors ({added_vec_count}). Check logs for errors.")
 
+        except sqlite3.Error as e:
+            logger.error(f"Database error during batch chunk insertion transaction: {e}", exc_info=True)
+            try: self.conn.rollback() # Rollback the entire transaction on error
+            except Exception as rb_err: logger.error(f"Rollback failed after batch insert error: {rb_err}")
+            raise # Re-raise the original error
 
     def delete_chunks_for_file(self, file_path: str) -> None:
-        """
-        Deletes all chunks associated with a specific file path from the database.
-        """
-        if not self.cursor or not self.conn:
-            logger.error("Database connection not established. Cannot delete chunks.")
-            raise ConnectionError("Database not connected")
-        if not file_path:
-             logger.warning("Attempted to delete chunks for an empty file path.")
-             return
+        """Deletes document records and associated vectors for a specific file path."""
+        if not self.cursor or not self.conn: raise ConnectionError("Database not connected")
+        if not file_path: logger.warning("Attempted delete with empty file path."); return
 
-        delete_sql = schema.get_delete_chunks_sql()
+        select_ids_sql = schema.get_select_ids_for_file_path_sql()
+        delete_docs_sql = schema.get_delete_documents_sql()
+
         try:
-            logger.debug(f"Executing delete for file path: {file_path}")
-            self.cursor.execute(delete_sql, (file_path,))
-            deleted_count = self.cursor.rowcount
-            self.conn.commit()
-            if deleted_count > 0:
-                logger.info(f"Successfully deleted {deleted_count} chunk(s) for file: {file_path}")
+            logger.debug(f"Starting transaction to delete records for file path: {file_path}")
+            # Begin transaction
+            self.cursor.execute("BEGIN TRANSACTION;")
+
+            # 1. Find IDs of documents matching the file path
+            self.cursor.execute(select_ids_sql, (file_path,))
+            ids_to_delete = [row[0] for row in self.cursor.fetchall()]
+
+            if ids_to_delete:
+                logger.debug(f"Found {len(ids_to_delete)} document IDs to delete.")
+                # 2. Delete vectors associated with these IDs from the virtual table
+                ids_placeholder = "(" + ",".join("?" * len(ids_to_delete)) + ")"
+                delete_vec_sql = schema.get_delete_vectors_sql(ids_placeholder)
+                logger.debug(f"Deleting {len(ids_to_delete)} vectors from virtual table...")
+                self.cursor.execute(delete_vec_sql, ids_to_delete)
+                deleted_vec_count = self.cursor.rowcount
+                logger.debug(f"Deleted {deleted_vec_count} vectors.")
+
+                # 3. Delete documents from the main table
+                logger.debug(f"Deleting documents from main table for file: {file_path}")
+                self.cursor.execute(delete_docs_sql, (file_path,))
+                deleted_doc_count = self.cursor.rowcount
+                logger.debug(f"Deleted {deleted_doc_count} documents.")
+
+                # Commit the transaction
+                self.conn.commit()
+                logger.info(f"Successfully deleted data for file: {file_path} ({deleted_doc_count} docs, {deleted_vec_count} vectors).")
             else:
-                logger.info(f"No chunks found in database to delete for file: {file_path}")
+                # No IDs found, just rollback (or commit an empty transaction)
+                logger.info(f"No documents found in database for file path: {file_path}. Nothing to delete.")
+                self.conn.rollback() # Rollback unnecessary transaction
+
         except sqlite3.Error as e:
             logger.error(f"Error deleting chunks for file {file_path}: {e}", exc_info=True)
-            try:
-                self.conn.rollback()
-            except Exception as rb_err:
-                 logger.error(f"Error during rollback after chunk deletion failure: {rb_err}")
+            try: self.conn.rollback()
+            except Exception as rb_err: logger.error(f"Rollback failed after delete error: {rb_err}")
             raise
 
-
     def get_indexed_files(self) -> Dict[str, float]:
-        """
-        Retrieves a dictionary mapping indexed file paths to their last modified timestamps.
-        """
-        # This method remains the same
+        """Retrieves indexed file paths and their last modified times from the main table."""
         if not self.cursor or not self.conn:
             logger.error("Database connection not established. Cannot get indexed files.")
             return {}
 
-        query_sql = schema.get_indexed_files_sql()
-        indexed_files: Dict[str, float] = {}
+        query_sql = schema.get_indexed_files_sql() # Uses main documents table
         try:
-            logger.debug("Querying for indexed files and their last modified times...")
+            logger.debug("Querying for indexed files and last modified times...")
             self.cursor.execute(query_sql)
             results = self.cursor.fetchall()
-
-            if results:
-                indexed_files = {row[0]: row[1] for row in results}
-                logger.info(f"Retrieved status for {len(indexed_files)} indexed files.")
-            else:
-                 logger.info("No indexed files found in the database.")
-
+            indexed_files = {row[0]: row[1] for row in results} if results else {}
+            logger.info(f"Retrieved status for {len(indexed_files)} indexed files.")
             return indexed_files
-
         except sqlite3.Error as e:
-            if "no such table" in str(e).lower():
-                logger.warning(f"Documents table '{schema.DOCUMENTS_TABLE}' not found. Assuming empty index.")
-                return {}
-            else:
-                logger.error(f"Error getting indexed files from database: {e}", exc_info=True)
-                return {}
+            if "no such table" in str(e).lower(): logger.warning(f"Table '{schema.DOCUMENTS_TABLE}' not found."); return {}
+            else: logger.error(f"Error getting indexed files: {e}", exc_info=True); return {}
 
+    def find_similar_chunks(
+        self,
+        query_embedding: np.ndarray,
+        k: int = 5,
+        notes_folder_path: Optional[str] = None
+    ) -> List[Tuple[str, int, str, float]]:
+        """Finds the k most similar chunks using the MATCH operator and vec0 virtual table."""
+        if not self.cursor or not self.conn: raise ConnectionError("Database not connected")
+        if query_embedding is None or not isinstance(query_embedding, np.ndarray) or query_embedding.ndim != 1: raise ValueError("Query embedding must be a 1D numpy array.")
+        if not isinstance(k, int) or k <= 0: raise ValueError("k must be a positive integer.")
 
-    def find_similar_chunks(self, query_embedding: np.ndarray, k: int = 5) -> List[Tuple[str, int, str, float]]:
-        """
-        Finds the k most similar document chunks to a given query embedding using vector search.
-        """
-        if not self.cursor or not self.conn:
-            logger.error("Database connection not established. Cannot perform vector search.")
-            raise ConnectionError("Database not connected")
-        if query_embedding is None or not isinstance(query_embedding, np.ndarray) or query_embedding.ndim != 1:
-             logger.error(f"Invalid query embedding provided for search. Shape: {query_embedding.shape if query_embedding is not None else 'None'}")
-             raise ValueError("Query embedding must be a 1D numpy array.")
-        if not isinstance(k, int) or k <= 0:
-             logger.error(f"Invalid value for k (top N results): {k}. Must be a positive integer.")
-             raise ValueError("k must be a positive integer.")
-
-        query_embedding = query_embedding.astype(np.float32)
-
-        # --- Check if vector_search function exists (runtime check) ---
-        # This helps diagnose if the extension isn't loaded correctly
         try:
-             self.cursor.execute("SELECT vector_search(?, ?, ?, ?)", (schema.DOCUMENTS_TABLE, schema.COL_EMBEDDING, query_embedding, 1))
-        except sqlite3.OperationalError as e:
-             if "no such function: vector_search" in str(e).lower():
-                 logger.error("The 'vector_search' function is not available in SQLite. "
-                              "Ensure the sqlite-vec library is correctly installed and loadable.", exc_info=True)
-                 raise RuntimeError("sqlite-vec extension function 'vector_search' not found.") from e
-             else:
-                 logger.warning(f"Operational error preparing vector search (may be expected if index is empty): {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error checking for vector_search function: {e}", exc_info=True)
+            # Serialize the query vector
+            serialized_query_embedding = serialize_vector(query_embedding)
+        except ValueError as e:
+             logger.error(f"Failed to serialize query embedding: {e}")
+             raise ValueError("Invalid query embedding for serialization.") from e
 
-        # Construct the vector search query using sqlite-vec's function
-        query = f"""
-            SELECT
-                {schema.COL_FILE_PATH},
-                {schema.COL_CHUNK_INDEX},
-                {schema.COL_CONTENT},
-                distance
-            FROM vector_search(?, ?, ?, ?)
-        """
+        # Determine if filtering by folder path is needed
+        filter_by_folder = bool(notes_folder_path)
+        query_sql = schema.get_vector_match_sql(k, filter_by_folder)
+        params: List[Any] = [serialized_query_embedding]
 
-        params = (
-            schema.DOCUMENTS_TABLE,
-            schema.COL_EMBEDDING,
-            query_embedding,
-            k
-        )
+        if filter_by_folder:
+            folder_prefix = os.path.join(notes_folder_path, '')
+            params.append(folder_prefix + '%')
+            logger.debug(f"Executing vector MATCH query with k={k}, filtering to folder: {notes_folder_path}")
+        else:
+            logger.debug(f"Executing vector MATCH query with k={k}, no folder filter.")
 
         try:
             start_time = time.time()
-            logger.debug(f"Executing vector search for top {k} similar chunks...")
-            self.cursor.execute(query, params)
+            self.cursor.execute(query_sql, tuple(params))
             results = self.cursor.fetchall()
             duration = time.time() - start_time
 
             if results:
-                logger.info(f"Found {len(results)} similar chunk(s) in {duration:.3f}s.")
+                logger.info(f"Found {len(results)} similar chunk(s) using MATCH in {duration:.3f}s.")
+                # Result format: (file_path, chunk_index, content, distance)
                 return results
             else:
-                logger.info("No similar chunks found matching the query.")
+                logger.info("No similar chunks found matching the query criteria.")
                 return []
 
         except sqlite3.Error as e:
-            # Handle specific errors related to vector search again here
-            if "no such function: vector_search" in str(e).lower():
-                 logger.error("Vector search function not available during query execution.", exc_info=True)
-                 raise RuntimeError("sqlite-vec extension function 'vector_search' not found.") from e
-            elif "no such virtual table" in str(e).lower() or "no such table: vec_" in str(e).lower(): # Check for internal index table name too
-                 logger.warning("Vector index virtual table not found during query. Has indexing run successfully?", exc_info=True)
-                 return []
-            elif "dimension mismatch" in str(e).lower():
-                 logger.error(f"Query vector dimension mismatch with index. Query shape: {query_embedding.shape}", exc_info=True)
-                 raise ValueError("Query embedding dimension mismatch.") from e
+            # Handle potential errors with MATCH operator or virtual table
+            if "malformed MATCH operand" in str(e).lower():
+                 logger.error("Malformed MATCH operand - check query vector serialization or dimension.", exc_info=True)
+                 raise ValueError("Invalid query vector format for MATCH.") from e
+            elif "no such table" in str(e).lower() and schema.VEC_DOCUMENTS_TABLE in str(e).lower():
+                 logger.warning(f"Virtual table '{schema.VEC_DOCUMENTS_TABLE}' not found.", exc_info=True)
+                 return [] # Treat as no results if table doesn't exist
             else:
-                logger.error(f"Error finding similar chunks: {e}", exc_info=True)
-                raise
-
+                logger.error(f"Error finding similar chunks using MATCH: {e}", exc_info=True)
+                raise # Re-raise other SQLite errors
 
     def close(self) -> None:
         """Closes the database connection safely."""
         if self.conn:
             try:
-                logger.debug("Attempting to commit any pending changes before closing DB connection.")
+                logger.debug("Attempting commit before closing DB connection.")
                 self.conn.commit()
                 logger.debug("Closing database connection.")
                 self.conn.close()
                 logger.info(f"Database connection closed: {self.db_path}")
-            except sqlite3.Error as e:
-                 logger.error(f"Error during commit/close of database connection: {e}", exc_info=True)
-            finally:
-                 self.conn = None
-                 self.cursor = None
-        else:
-             logger.debug("Close called but database connection was already closed or not established.")
-
+            except sqlite3.Error as e: logger.error(f"Error during commit/close: {e}", exc_info=True)
+            finally: self.conn, self.cursor = None, None
+        else: logger.debug("Close called but DB already closed/not connected.")
 
     def __enter__(self):
-        """Enter the runtime context related to this object (for 'with' statement)."""
+        """Enter runtime context."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit the runtime context related to this object (for 'with' statement)."""
+        """Exit runtime context, ensuring connection closure."""
         logger.debug("Exiting DbManager context, ensuring connection is closed.")
         self.close()
