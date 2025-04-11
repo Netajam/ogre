@@ -1,0 +1,8 @@
+PyQt6>=6.7 
+PyQt6
+sqlite-vec
+sentence-transformers
+langchain-text-splitters
+numpy 
+google-generativeai
+python-dotenv
