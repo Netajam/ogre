@@ -6,3 +6,4 @@ langchain-text-splitters
 numpy 
 google-generativeai
 python-dotenv
+markdown>=3.8

@@ -453,7 +453,13 @@ class MainWindow(QMainWindow):
                 self.display_panel.note_output_view.clear()
                 self.display_panel.show_view(0) # Ensure note view is active
                 return
+            logger.info(f"Attempting to call display_panel.set_note_content for {file_path.name}")
 
+            self.display_panel.set_note_content(
+                file_path=file_path,
+                full_content=full_content,
+                highlight_chunk=chunk_text # Pass the chunk text for highlighting
+            )
             # --- Update the correct display panel widget ---
             target_view = self.display_panel.note_output_view
             target_view.setPlainText(full_content)
